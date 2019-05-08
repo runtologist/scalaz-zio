@@ -211,6 +211,35 @@ trait ZStream[-R, +E, +A] extends Serializable { self =>
       }
   }
 
+  def mapAsync[R1 <: R, E1 >: E, B](n: Int)(f: A => ZIO[R1, E1, B]): ZStream[R1, E1, B] =
+    ZStream.unwrap(
+      for {
+        q <- Queue.bounded[Fiber[E1, B]](n)
+        p <- Promise.make[E1, Unit]
+        _ <- foreach(a => f(a).supervised.fork.flatMap(q.offer).unit)
+              .flatMap(r => p.succeed(r) *> q.shutdown)
+              .catchAll(p.fail)
+              .supervised
+              .fork
+              // TODO interruption
+      } yield Stream.fromQueue(q).mapM(_.join) ++ Stream.fromEffect(p.await).drain
+    )
+
+  def mapAsyncUnordered[R1 <: R, E1 >: E, B](n: Int)(f: A => ZIO[R1, E1, B]): ZStream[R1, E1, B] =
+    ZStream.unwrap(
+      for {
+        s <- Semaphore.make(n.toLong)
+        q <- Queue.bounded[B](1)
+        p <- Promise.make[E1, Unit]
+        _ <- foreach(a => s.acquire *> f(a).flatMap(b => q.offer(b) *> s.release).supervised.fork.unit)
+              .flatMap(p.succeed)
+              .catchAll(p.fail)
+              .supervised
+              .fork
+              // TODO interruption
+      } yield Stream.fromQueue(q) ++ Stream.fromEffect(p.await).drain
+    )
+
   /**
    * Maps each element to a chunk, and flattens the chunks into the output of
    * this stream.
